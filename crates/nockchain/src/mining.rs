@@ -111,7 +111,6 @@ pub fn create_mining_driver(
             if !mine {
                 return Ok(());
             }
-            let mut next_attempt: Option<NounSlab> = None;
             let mut current_attempt: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
             loop {
@@ -132,27 +131,15 @@ pub fn create_mining_driver(
                                 slab.copy_into(effect_cell.tail());
                                 slab
                             };
-                            if !current_attempt.is_empty() {
-                                next_attempt = Some(candidate_slab);
-                            } else {
-                                let (cur_handle, attempt_handle) = handle.dup();
-                                handle = cur_handle;
-                                current_attempt.spawn(mining_attempt(candidate_slab, attempt_handle));
-                            }
+                            let (cur_handle, attempt_handle) = handle.dup();
+                            handle = cur_handle;
+                            current_attempt.spawn(mining_attempt(candidate_slab, attempt_handle));
                         }
                     },
                     mining_attempt_res = current_attempt.join_next(), if !current_attempt.is_empty()  => {
                         if let Some(Err(e)) = mining_attempt_res {
                             warn!("Error during mining attempt: {e:?}");
                         }
-                        let Some(candidate_slab) = next_attempt else {
-                            continue;
-                        };
-                        next_attempt = None;
-                        let (cur_handle, attempt_handle) = handle.dup();
-                        handle = cur_handle;
-                        current_attempt.spawn(mining_attempt(candidate_slab, attempt_handle));
-
                     }
                 }
             }

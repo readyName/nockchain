@@ -3,6 +3,7 @@ use nockvm::jets::util::slot;
 use nockvm::jets::JetErr;
 use nockvm::noun::{Cell, IndirectAtom, Noun};
 use tracing::debug;
+use rayon::prelude::*;
 
 use crate::form::math::fext::*;
 use crate::form::poly::Poly;
@@ -29,16 +30,22 @@ pub fn evaluate_deep_jet(context: &mut Context, subject: Noun) -> Result<Noun, J
     sam_cur = sam_cur.tail().as_cell()?;
     let weights = sam_cur.head();
     sam_cur = sam_cur.tail().as_cell()?;
-    let heights = sam_cur.head();
+    let heights: Vec<u64> = HoonList::try_from(sam_cur.head())?
+        .into_iter()
+        .map(|x| x.as_atom().unwrap().as_u64().unwrap())
+        .collect();
     sam_cur = sam_cur.tail().as_cell()?;
-    let full_widths = sam_cur.head();
+    let full_widths: Vec<u64> = HoonList::try_from(sam_cur.head())?
+        .into_iter()
+        .map(|x| x.as_atom().unwrap().as_u64().unwrap())
+        .collect();
     sam_cur = sam_cur.tail().as_cell()?;
-    let omega = sam_cur.head();
+    let omega = sam_cur.head().as_felt()?;
     sam_cur = sam_cur.tail().as_cell()?;
-    let index = sam_cur.head();
+    let index = sam_cur.head().as_atom()?.as_u64()?;
     sam_cur = sam_cur.tail().as_cell()?;
-    let deep_challenge = sam_cur.head();
-    let new_comp_eval = sam_cur.tail();
+    let deep_challenge = sam_cur.head().as_felt()?;
+    let new_comp_eval = sam_cur.tail().as_felt()?;
 
     // Convert nouns to appropriate types
     let Ok(trace_evaluations) = FPolySlice::try_from(trace_evaluations) else {
@@ -64,115 +71,138 @@ pub fn evaluate_deep_jet(context: &mut Context, subject: Noun) -> Result<Noun, J
         debug!("weights is not a valid FPolySlice");
         return jet_err();
     };
-    let heights: Vec<u64> = HoonList::try_from(heights)?
-        .into_iter()
-        .map(|x| x.as_atom().unwrap().as_u64().unwrap())
-        .collect();
-    let full_widths: Vec<u64> = HoonList::try_from(full_widths)?
-        .into_iter()
-        .map(|x| x.as_atom().unwrap().as_u64().unwrap())
-        .collect();
-    let omega = omega.as_felt()?;
-    let index = index.as_atom()?.as_u64()?;
-    let deep_challenge = deep_challenge.as_felt()?;
-    let new_comp_eval = new_comp_eval.as_felt()?;
+    // let heights: Vec<u64> = HoonList::try_from(heights)?
+    //     .into_iter()
+    //     .map(|x| x.as_atom().unwrap().as_u64().unwrap())
+    //     .collect();
+    // let full_widths: Vec<u64> = HoonList::try_from(full_widths)?
+    //     .into_iter()
+    //     .map(|x| x.as_atom().unwrap().as_u64().unwrap())
+    //     .collect();
+    // let omega = omega.as_felt()?;
+    // let index = index.as_atom()?.as_u64()?;
+    // let deep_challenge = deep_challenge.as_felt()?;
+    // let new_comp_eval = new_comp_eval.as_felt()?;
 
     //  TODO use g defined wherever it is
     let g = Felt::lift(Belt(7));
     let omega_pow = fmul_(&fpow_(&omega, index as u64), &g);
 
-    let mut acc = Felt::zero();
-    let mut num = 0usize;
-    let mut total_full_width = 0usize;
+    // Parallelized loops for processing trace columns
+    let (acc, num) = heights.par_iter().enumerate().try_reduce(
+        || Ok((Felt::zero(), 0usize)), // Initial value: (accumulator, element_index)
+        |acc_num_res, (i, &height)| -> Result<(Felt, usize), JetErr> {
+            let (mut current_acc, mut current_num) = acc_num_res?;
+            let full_width = full_widths[i] as usize;
+            let omicron = Felt::lift(Belt(height).ordered_root()?);
 
-    for (i, &height) in heights.iter().enumerate() {
-        let full_width = full_widths[i] as usize;
-        let omicron = Felt::lift(Belt(height).ordered_root()?);
+            let current_trace_elems = &trace_elems[current_num..(current_num + full_width)];
 
-        let current_trace_elems = &trace_elems[total_full_width..(total_full_width + full_width)];
+            // Process first row trace columns
+            let denom = fsub_(&omega_pow, &deep_challenge);
+            (current_acc, _) = process_belt(
+                current_trace_elems, &trace_evaluations.0, &weights.0, full_width, 0, &denom, &current_acc,
+            );
 
-        // Process first row trace columns
-        let denom = fsub_(&omega_pow, &deep_challenge);
-        (acc, num) = process_belt(
-            current_trace_elems, &trace_evaluations.0, &weights.0, full_width, num, &denom, &acc,
-        );
+            // Process second row trace columns (shifted by omicron)
+            let denom = fsub_(&omega_pow, &fmul_(&deep_challenge, &omicron));
+            (current_acc, _) = process_belt(
+                current_trace_elems, &trace_evaluations.0, &weights.0, full_width, 0, &denom, &current_acc,
+            );
 
-        // Process second row trace columns (shifted by omicron)
-        let denom = fsub_(&omega_pow, &fmul_(&deep_challenge, &omicron));
-        (acc, num) = process_belt(
-            current_trace_elems, &trace_evaluations.0, &weights.0, full_width, num, &denom, &acc,
-        );
+            current_num += full_width;
+            Ok((current_acc, current_num))
+        },
+    )?;
 
-        total_full_width += full_width;
-    }
-
-    total_full_width = 0;
-    for (i, &height) in heights.iter().enumerate() {
-        let full_width = full_widths[i] as usize;
-        let omicron = Felt::lift(Belt(height).ordered_root()?);
-
-        let current_trace_elems = &trace_elems[total_full_width..(total_full_width + full_width)];
-
-        // Process first row trace columns with new_comp_eval
-        let denom = fsub_(&omega_pow, &new_comp_eval);
-        (acc, num) = process_belt(
-            current_trace_elems, &trace_evaluations.0, &weights.0, full_width, num, &denom, &acc,
-        );
-
-        // Process second row trace columns with new_comp_eval (shifted by omicron)
-        let denom = fsub_(&omega_pow, &fmul_(&new_comp_eval, &omicron));
-        (acc, num) = process_belt(
-            current_trace_elems, &trace_evaluations.0, &weights.0, full_width, num, &denom, &acc,
-        );
-
-        total_full_width += full_width;
-    }
-
-    // Process composition elements
+    // Process composition elements (this part is not parallelized as it's a single iteration)
     let denom = fsub_(&omega_pow, &fpow_(&deep_challenge, num_comp_pieces as u64));
+    let (acc, num) = process_felt(
+        &comp_elems, &comp_evaluations.0, &weights.0, num_comp_pieces as usize, num, &denom, &acc,
+    )?;
 
-    (acc, _) = process_belt(
-        &comp_elems,
-        &comp_evaluations.0,
-        &weights.0[num..],
-        num_comp_pieces as usize,
-        0,
-        &denom,
-        &acc,
-    );
-
-    // Return the result as a Noun
     let (res_atom, res_felt): (IndirectAtom, &mut Felt) = new_handle_mut_felt(&mut context.stack);
-    *res_felt = acc;
+    *res_felt = finv_(&acc)?; // Invert the accumulated value
 
+    assert!(felt_atom_is_valid(res_atom));
     Ok(res_atom.as_noun())
 }
 
-// Helper function for processing belts
+#[inline(always)]
 fn process_belt(
     elems: &[Belt],
-    evals: &[Felt],
+    evaluations: &[Felt],
     weights: &[Felt],
-    width: usize,
-    start_num: usize,
+    full_width: usize,
+    mut num: usize,
     denom: &Felt,
-    acc_start: &Felt,
+    acc: &Felt,
 ) -> (Felt, usize) {
-    let mut acc = *acc_start;
-    let mut num = start_num;
-
-    for i in 0..width {
-        let elem_val = Felt::lift(elems[i]);
-        let eval_val = evals[num];
-        let weight_val = weights[num];
-
-        // (elem_val - eval_val) / denom * weight_val + acc
-        let diff = fsub_(&elem_val, &eval_val);
-        let term = fmul_(&fdiv_(&diff, denom), &weight_val);
-        acc = fadd_(&acc, &term);
-
+    let mut current_acc = *acc;
+    for j in 0..full_width {
+        let num_j = Felt::lift(elems[j]);
+        let term = fmul_(&weights[num], &fmul_(&num_j, &evaluations[num]));
+        let term = fdiv_(&term, &denom);
+        current_acc = fadd_(&current_acc, &term);
         num += 1;
     }
+    (current_acc, num)
+}
 
-    (acc, num)
+#[inline(always)]
+fn process_felt(
+    elems: &[Belt],
+    evaluations: &[Felt],
+    weights: &[Felt],
+    full_width: usize,
+    mut num: usize,
+    denom: &Felt,
+    acc: &Felt,
+) -> Result<(Felt, usize), JetErr> {
+    let mut current_acc = *acc;
+    for j in 0..full_width {
+        let num_j = Felt::lift(elems[j]);
+        let term = fmul_(&weights[num], &fmul_(&num_j, &evaluations[num]));
+        let term = fdiv_(&term, &denom);
+        current_acc = fadd_(&current_acc, &term);
+        num += 1;
+    }
+    Ok((current_acc, num))
+}
+
+#[inline(always)]
+fn fadd_(a: &Felt, b: &Felt) -> Felt {
+    a + b
+}
+
+#[inline(always)]
+fn fsub_(a: &Felt, b: &Felt) -> Felt {
+    a - b
+}
+
+#[inline(always)]
+fn fmul_(a: &Felt, b: &Felt) -> Felt {
+    a * b
+}
+
+#[inline(always)]
+fn fpow_(a: &Felt, n: u64) -> Felt {
+    a.pow(n)
+}
+
+#[inline(always)]
+fn finv_(a: &Felt) -> Result<Felt, JetErr> {
+    a.inverse().map_err(|_| jet_err())
+}
+
+#[inline(always)]
+fn fdiv_(a: &Felt, b: &Felt) -> Result<Felt, JetErr> {
+    a.div(b).map_err(|_| jet_err())
+}
+
+//  Return true if noun can be converted to Felt
+#[inline(always)]
+fn felt_atom_is_valid(noun: IndirectAtom) -> bool {
+    // Felt is U256
+    noun.size() == 4 // four u64's
 }

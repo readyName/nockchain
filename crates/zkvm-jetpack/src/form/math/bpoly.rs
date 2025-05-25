@@ -1,7 +1,9 @@
 use std::vec;
+use rayon::prelude::*;
 
-use crate::form::math::{bpow, FieldError};
+use crate::form::math::{bpow, FieldError, binv};
 use crate::form::poly::*;
+use crate::form::belt::ROOTS;
 
 pub fn bpadd(a: &[Belt], b: &[Belt], res: &mut [Belt]) {
     let min: &[Belt];
@@ -197,16 +199,6 @@ pub fn bppow(a: &[Belt], mut n: usize) -> Vec<Belt> {
     q
 }
 
-#[inline]
-fn bitreverse(mut n: u32, l: u32) -> u32 {
-    let mut r = 0;
-    for _ in 0..l {
-        r = (r << 1) | (n & 1);
-        n >>= 1;
-    }
-    r
-}
-
 #[inline(always)]
 pub fn bp_fft(bp: &[Belt]) -> Result<Vec<Belt>, FieldError> {
     let order: Belt = Belt(bp.len() as u64);
@@ -228,35 +220,66 @@ pub fn bp_ntt(bp: &[Belt], root: &Belt) -> Vec<Belt> {
     let mut x: Vec<Belt> = vec![Belt(0); n as usize];
     x.copy_from_slice(bp);
 
-    for k in 0..n {
+    // Parallel bit reversal
+    x.par_iter_mut().enumerate().for_each(|(k_usize, val)| {
+        let k = k_usize as u32;
         let rk = bitreverse(k, log_2_of_n);
         if k < rk {
-            x.swap(rk as usize, k as usize);
+            // Perform swap on the original vector using indices
+            // This is safe because k and rk are unique for each thread in this range
+            let original_x = unsafe { &mut *(&mut x as *mut Vec<Belt>) };
+            original_x.swap(k_usize, rk as usize);
         }
-    }
+    });
 
     let mut m = 1;
     for _ in 0..log_2_of_n {
         let w_m: Belt = bpow(root.0, (n / (2 * m)) as u64).into();
 
-        let mut k = 0;
-        while k < n {
+        // Parallel butterfly operations
+        (0..n / (2 * m)).into_par_iter().for_each(|i| {
+            let k = i * 2 * m;
             let mut w = Belt(1);
 
             for j in 0..m {
-                let u: Belt = x[(k + j) as usize];
-                let v: Belt = x[(k + j + m) as usize] * w;
-                x[(k + j) as usize] = u + v;
-                x[(k + j + m) as usize] = u - v;
+                let idx1 = (k + j) as usize;
+                let idx2 = (k + j + m) as usize;
+                
+                // Get mutable references to elements
+                // This is safe because idx1 and idx2 are distinct for each parallel iteration (each 'i')
+                let (slice1, slice2) = if idx1 < idx2 {
+                    x.split_at_mut(idx2)
+                } else {
+                    let (s2, s1) = x.split_at_mut(idx1);
+                    (s1, s2)
+                };
+                let u = slice1.last().unwrap();
+                let v_elem = slice2.first().unwrap();
+
+                let v: Belt = *v_elem * w;
+                
+                // Update elements
+                let u_val = *u;
+                *slice1.last_mut().unwrap() = u_val + v;
+                *slice2.first_mut().unwrap() = u_val - v;
+
                 w = w * w_m;
             }
-
-            k += 2 * m;
-        }
+        });
 
         m *= 2;
     }
     x
+}
+
+#[inline]
+fn bitreverse(mut n: u32, l: u32) -> u32 {
+    let mut r = 0;
+    for _ in 0..l {
+        r = (r << 1) | (n & 1);
+        n >>= 1;
+    }
+    r
 }
 
 #[inline(always)]
@@ -313,12 +336,19 @@ pub fn bpdvr(a: &[Belt], b: &[Belt], q: &mut [Belt], res: &mut [Belt]) {
     while deg_r >= deg_b {
         let coeff = r[i] / b[end_b];
         q[q_index as usize] = coeff;
-        for k in 0..(deg_b + 1) {
+        
+        // Parallelize the inner loop for updating remainder polynomial coefficients
+        (0..(deg_b + 1)).into_par_iter().for_each(|k| {
             let index = k as usize;
             if k <= a_end as u32 && k < b.len() as u32 && k <= (i as u32) {
-                r[i - index] = r[i - index] - coeff * b[end_b - index];
+                 // Access the remainder vector mutably. This is safe because each thread
+                 // is updating a distinct element of 'r' based on the 'index'.
+                let r_elem = unsafe { r.get_unchecked_mut(i - index) };
+                let b_elem = unsafe { b.get_unchecked(end_b - index) };
+                *r_elem = *r_elem - coeff * (*b_elem);
             }
-        }
+        });
+
         deg_r = deg_r.saturating_sub(1);
         q_index = q_index.saturating_sub(1);
         if deg_r == 0 && r[0] == 0 {
@@ -427,4 +457,81 @@ pub fn normalize_bpoly(a: &mut Vec<Belt>) {
             break;
         }
     }
+}
+
+#[inline(always)]
+pub fn bpmul_ntt(a: &[Belt], b: &[Belt], res: &mut [Belt]) -> Result<(), FieldError> {
+    let result_len = a.len() + b.len() - 1;
+    if result_len == 0 {
+        res.fill(Belt(0));
+        return Ok(());
+    }
+
+    // Determine the size for NTT (next power of 2 greater than result_len)
+    let n = result_len.checked_next_power_of_two().ok_or(FieldError::NTTSizeError)?;
+
+    // Zero-extend input polynomials
+    let mut a_padded = vec![Belt(0); n];
+    a_padded[0..a.len()].copy_from_slice(a);
+
+    let mut b_padded = vec![Belt(0); n];
+    b_padded[0..b.len()].copy_from_slice(b);
+
+    // Get the root for NTT
+    let log_2_of_n = n.ilog2();
+    if (log_2_of_n as usize) >= ROOTS.len() {
+        return Err(FieldError::OrderedRootError);
+    }
+    let root = ROOTS[log_2_of_n as usize].into();
+
+    // Perform NTT on both polynomials
+    let a_ntt = bp_ntt(&a_padded, &root);
+    let b_ntt = bp_ntt(&b_padded, &root);
+
+    // Perform Hadamard product (pointwise multiplication)
+    let mut hadamard_res = vec![Belt(0); n];
+    bp_hadamard(&a_ntt, &b_ntt, &mut hadamard_res);
+
+    // Perform inverse NTT
+    let inv_root = root.inv();
+    let mut result_ntt = bp_ntt(&hadamard_res, &inv_root);
+
+    // Scale by 1/n
+    let n_inv = Belt(n as u64).inv();
+    for val in result_ntt.iter_mut() {
+        *val = *val * n_inv;
+    }
+
+    // Copy the result (truncated to original expected length)
+    let copy_len = std::cmp::min(result_len, res.len());
+    res[0..copy_len].copy_from_slice(&result_ntt[0..copy_len]);
+
+    // Fill the rest with zeros if res is larger than result_len
+    if res.len() > result_len {
+        res[result_len..].fill(Belt(0));
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+pub fn bpmul_jet(context: &mut Context, subject: Noun) -> Result {
+    let sam = slot(subject, 6)?;
+    let p = slot(sam, 2)?;
+    let q = slot(sam, 3)?;
+
+    let (Ok(p_poly), Ok(q_poly)) = (BPolySlice::try_from(p), BPolySlice::try_from(q)) else {
+        return jet_err();
+    };
+
+    let res_len = p_poly.len() + q_poly.len() - 1;
+    let (res, res_poly): (IndirectAtom, &mut [Belt]) =
+        new_handle_mut_slice(&mut context.stack, Some(res_len as usize));
+
+    // Use the new NTT-based multiplication
+    bpmul_ntt(p_poly.0, q_poly.0, res_poly).map_err(|_| jet_err())?;
+
+    let res_cell = finalize_poly(&mut context.stack, Some(res_poly.len()), res);
+
+    Ok(res_cell)
 }

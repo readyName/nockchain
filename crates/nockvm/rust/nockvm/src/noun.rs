@@ -6,6 +6,7 @@ use intmap::IntMap;
 use nockvm_macros::tas;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::{error, fmt, ptr};
+use std::collections::HashMap;
 
 crate::gdb!();
 
@@ -1476,15 +1477,37 @@ impl fmt::Debug for Noun {
 impl Slots for Noun {}
 impl private::RawSlots for Noun {
     fn raw_slot(&self, axis: &BitSlice<u64, Lsb0>) -> Result<Noun> {
-        match self.as_either_atom_cell() {
-            Right(cell) => cell.raw_slot(axis),
-            Left(_atom) => {
-                if axis.last_one() == Some(0) {
-                    Ok(*self)
+        unsafe {
+            // Optimization for common axes: 2 and 3
+            if axis.len() == 1 {
+                let bit = axis[0];
+                if let Ok(cell) = self.as_cell() {
+                    if bit == false { // axis 2
+                        return Ok(cell.head());
+                    } else { // axis 3
+                        return Ok(cell.tail());
+                    }
                 } else {
-                    // Axis tried to descend through atom
-                    Err(Error::NotCell)
+                    // Axis invalid for atom
+                    return Err(Error::NotCell);
                 }
+            }
+
+            // Original recursive logic for other axes
+            if axis.is_empty() {
+                return Ok(*self);
+            }
+
+            let bit = axis[0];
+            let mut cursor = self.as_cell()?;
+            let rest = &axis[1..];
+
+            if bit == false {
+                // head
+                cursor.head().raw_slot(rest)
+            } else {
+                // tail
+                cursor.tail().raw_slot(rest)
             }
         }
     }
@@ -1545,6 +1568,98 @@ mod private {
          */
         fn raw_slot(&self, axis: &BitSlice<u64, Lsb0>) -> Result<Noun>;
     }
+}
+
+/** Test for structural equality, potentially allocating while normalizing. */
+// pub fn unifying_equality(stack: &mut NockStack, left: &mut Noun, right: &mut Noun) -> bool {
+//     // Normalization should happen outside of equality checks.
+//     // assert!(left.is_normalized());
+//     // assert!(right.is_normalized());
+
+//     unsafe { left.raw_equals(&right) }
+// }
+
+// Using a more robust unifying equality that handles potential normalization and structural sharing
+pub fn unifying_equality(stack: &mut NockStack, left: &mut Noun, right: &mut Noun) -> bool {
+    unsafe {
+        // Use a HashMap to cache results of already compared noun pairs
+        let mut cache: HashMap<(*const u64, *const u64), bool> = HashMap::new();
+        unifying_equality_recursive(stack, left.raw, right.raw, &mut cache)
+    }
+}
+
+// Recursive helper function with caching
+unsafe fn unifying_equality_recursive(
+    stack: &mut NockStack,
+    left_raw: u64,
+    right_raw: u64,
+    cache: &mut HashMap<(*const u64, *const u64), bool>,
+) -> bool {
+    // Check cache first
+    if let Some(&result) = cache.get(&(left_raw as *const u64, right_raw as *const u64)) {
+        return result;
+    }
+    if let Some(&result) = cache.get(&(right_raw as *const u64, left_raw as *const u64)) {
+        return result;
+    }
+
+    // Direct comparison of raw values
+    if left_raw == right_raw {
+        cache.insert((left_raw as *const u64, right_raw as *const u64), true);
+        return true;
+    }
+
+    let left_noun = Noun { raw: left_raw };
+    let right_noun = Noun { raw: right_raw };
+
+    // Check for direct atoms (already handled by raw_equals if values are the same)
+    if left_noun.is_direct() || right_noun.is_direct() {
+         cache.insert((left_raw as *const u64, right_raw as *const u64), false);
+         return false;
+    }
+
+    // Handle allocated nouns (indirect atoms and cells)
+    if let (Ok(left_allocated), Ok(right_allocated)) = (left_noun.as_allocated(), right_noun.as_allocated()) {
+        // Check for forwarding pointers and follow them
+        if let Some(forwarded) = left_allocated.forwarding_pointer() {
+            return unifying_equality_recursive(stack, forwarded.as_noun().raw, right_raw, cache);
+        }
+        if let Some(forwarded) = right_allocated.forwarding_pointer() {
+            return unifying_equality_recursive(stack, left_raw, forwarded.as_noun().raw, cache);
+        }
+
+        // Cache the current comparison to handle cycles
+        cache.insert((left_raw as *const u64, right_raw as *const u64), false); // Assume false initially
+
+        let result = if let (Ok(left_cell), Ok(right_cell)) = (left_allocated.cell(), right_allocated.cell()) {
+            // Compare cells recursively
+            let head_equal = unifying_equality_recursive(stack, left_cell.head().raw, right_cell.head().raw, cache);
+            if !head_equal {
+                false
+            } else {
+                unifying_equality_recursive(stack, left_cell.tail().raw, right_cell.tail().raw, cache)
+            }
+        } else if let (Ok(left_indirect), Ok(right_indirect)) = (left_allocated.indirect(), right_allocated.indirect()) {
+            // Compare indirect atoms - check size and then data
+            if left_indirect.size() != right_indirect.size() {
+                false
+            } else {
+                left_indirect.as_slice() == right_indirect.as_slice()
+            }
+        } else {
+            // One is indirect atom, other is cell - not equal
+            false
+        };
+
+        // Update cache with the actual result
+        cache.insert((left_raw as *const u64, right_raw as *const u64), result);
+        return result;
+    }
+
+    // Should not reach here for normalized nouns unless there's a bug
+    // eprintln!("Error: unifying_equality reached unexpected state for {:?} and {:?}", left_noun, right_noun);
+    cache.insert((left_raw as *const u64, right_raw as *const u64), false);
+    false
 }
 
 #[cfg(test)]
